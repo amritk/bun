@@ -285,6 +285,9 @@ declare module "bun" {
      * - if `nodebuffer`, binary data is returned as `Buffer` objects. **(default)**
      * - if `arraybuffer`, binary data is returned as `ArrayBuffer` objects.
      * - if `uint8array`, binary data is returned as `Uint8Array` objects.
+     * - if `blob`, binary data is returned as `Blob` objects.
+     *
+     * This applies to binary messages and to the payloads of pings and pongs.
      *
      * @example
      * ```ts
@@ -295,7 +298,7 @@ declare module "bun" {
      * });
      * ```
      */
-    binaryType?: "nodebuffer" | "arraybuffer" | "uint8array";
+    binaryType?: "nodebuffer" | "arraybuffer" | "uint8array" | "blob";
 
     /**
      * Custom data you can assign to a client. It can be read and written at any time.
@@ -411,6 +414,9 @@ declare module "bun" {
      * - if `nodebuffer`, then the message is a `Buffer`.
      * - if `arraybuffer`, then the message is an `ArrayBuffer`.
      * - if `uint8array`, then the message is a `Uint8Array`.
+     * - if `blob`, then the message is a `Blob`.
+     *
+     * The declared type of `message` is the one of the default `binaryType`.
      *
      * @param ws The websocket that sent the message
      * @param message The message received
@@ -444,6 +450,9 @@ declare module "bun" {
     /**
      * Called when a ping is received.
      *
+     * Like a binary message, `data` has the type that `binaryType` selects.
+     * The declared type is the one of the default `binaryType`.
+     *
      * @param ws The websocket that received the ping
      * @param data The data sent with the ping
      */
@@ -451,6 +460,9 @@ declare module "bun" {
 
     /**
      * Called when a pong is received.
+     *
+     * Like a binary message, `data` has the type that `binaryType` selects.
+     * The declared type is the one of the default `binaryType`.
      *
      * @param ws The websocket that received the pong
      * @param data The data sent with the pong
@@ -517,6 +529,186 @@ declare module "bun" {
            */
           decompress?: WebSocketCompressor | boolean;
         };
+  }
+
+  /**
+   * One WebTransport session over HTTP/3, as {@link WebTransportHandler} sees
+   * it.
+   *
+   * Datagrams only. WebTransport streams are not implemented. A stream the
+   * peer opens on a session is refused rather than left waiting.
+   *
+   * @experimental
+   */
+  interface WebTransportSession<T = unknown> {
+    /**
+     * Send one datagram.
+     *
+     * Returns the bytes queued. That count includes the session's frame
+     * prefix, so an empty payload still reports a positive number.
+     *
+     * Returns `0` when the connection's queue had no room. Drop the datagram:
+     * this path has no retransmission, and the next one is worth more than a
+     * late one. The queue lives on the connection and is shared by its
+     * sessions; the {@link WebTransportHandler.drain} handler says when it
+     * has emptied. A send on a session that has already ended also returns
+     * `0`, rather than throwing, since racing the peer's close is normal.
+     *
+     * Returns `-1` when the payload is larger than {@link maxDatagramSize}.
+     * Unlike `0` this is not backpressure and never comes back on its own:
+     * retrying the same payload returns `-1` forever.
+     */
+    sendDatagram(data: string | BufferSource): number;
+
+    /**
+     * Close the session. Sends a `WT_CLOSE_SESSION` capsule, then ends the
+     * session's stream.
+     *
+     * The `close` handler runs before this returns. It receives the `code` and
+     * `reason` given here.
+     */
+    close(code?: number, reason?: string): void;
+
+    /**
+     * Ask the peer to wind the session up, without ending it.
+     *
+     * This sends the signal and nothing more. Datagrams still flow, and the
+     * `close` handler does not run until something actually closes the
+     * session. A browser surfaces the signal as `WebTransport.draining`.
+     *
+     * Use this to let sessions finish before a redeploy. Use {@link close}
+     * when they should stop now. The other direction — the send queue
+     * regaining room — is the {@link WebTransportHandler.drain} handler.
+     */
+    startDraining(): void;
+
+    /**
+     * Arbitrary data attached to this session. Set from whatever
+     * {@link WebTransportHandler.upgrade} returned. Writable afterwards.
+     */
+    data: T;
+
+    /**
+     * The largest payload {@link sendDatagram} will queue.
+     *
+     * This is the server's own limit, capped by the `max_datagram_frame_size`
+     * the peer advertised, less the session's frame prefix. It bounds what
+     * this server sends; the browser's `datagrams.maxDatagramSize` bounds the
+     * other direction, and the two differ because each side computes its own
+     * limit from what its peer advertised.
+     *
+     * `0` means the peer offered no datagram support. That session carries no
+     * datagrams, and every {@link sendDatagram} returns `-1`. A session that
+     * has already closed also reports `0`; {@link closed} tells the two
+     * apart.
+     */
+    readonly maxDatagramSize: number;
+
+    /**
+     * Whether the session has ended. A boolean, deliberately not the W3C
+     * API's `closed` promise — `await session.closed` would await a boolean
+     * and resolve immediately. The end of a session is delivered to
+     * {@link WebTransportHandler.close}.
+     */
+    readonly closed: boolean;
+
+    /**
+     * Smoothed round-trip time to the peer, in milliseconds.
+     *
+     * The connection's live estimate, the same figure the W3C API reports as
+     * `smoothedRtt` — a server relaying between peers can report the leg a
+     * client cannot measure itself. `0` means the session has ended: a live
+     * session always has samples, because its handshake took at least one
+     * round trip.
+     */
+    readonly rtt: number;
+  }
+
+  /**
+   * Handlers for WebTransport sessions on a {@link Serve.Options.http3}
+   * server.
+   *
+   * @experimental
+   */
+  interface WebTransportHandler<T = unknown> {
+    /**
+     * Decide whether to accept a session, before the `CONNECT` is answered.
+     *
+     * Return a {@link Response} to refuse. Bun sends that response and opens
+     * no session. That response needs a buffered body and a real status. Bun
+     * cannot send a streaming body, an already-read body, or `Response.error()`
+     * on a `CONNECT`, and answers `500` instead.
+     *
+     * Return anything else, or nothing, to accept. What you return becomes the
+     * session's {@link WebTransportSession.data}, exactly as returned — there
+     * is no `{ data }` unwrapping as in `server.upgrade()` for WebSockets,
+     * and returning `false` accepts a session whose `data` is `false`. The
+     * `Response` return is the one refusal.
+     *
+     * Without this handler Bun accepts every WebTransport `CONNECT` on the
+     * server. Authentication and routing by path belong here. This is the only
+     * point where the request is still visible and refusing is still possible.
+     *
+     * `server.requestIP(request)` answers here and only here — per-address
+     * limits belong in this handler, and a session that should know its peer's
+     * address later should return it into {@link WebTransportSession.data}.
+     * After `upgrade` returns it answers `null`, as it does for any request
+     * whose connection context is gone.
+     *
+     * This handler is synchronous. Bun does not await a returned promise, and
+     * treats it as an ordinary truthy value. The `CONNECT` has to be answered
+     * while the request is still in hand.
+     *
+     * ```ts
+     * upgrade(req, server) {
+     *   const url = new URL(req.url);
+     *   if (url.pathname !== "/game") return new Response(null, { status: 404 });
+     *   const user = verify(req.headers.get("authorization"));
+     *   if (!user) return new Response(null, { status: 401 });
+     *   return { user, address: server.requestIP(req)?.address };
+     * }
+     * ```
+     */
+    upgrade?(request: Request, server: Server<unknown>): Response | T | void;
+
+    /** A session was accepted. */
+    open?(session: WebTransportSession<T>): void | Promise<void>;
+
+    /**
+     * A datagram arrived.
+     *
+     * `data` is a fresh `Uint8Array` per datagram. Bun copies rather than
+     * views, because the receive buffer underneath is reused before the next
+     * turn of the event loop.
+     */
+    datagram?(session: WebTransportSession<T>, data: Uint8Array): void | Promise<void>;
+
+    /**
+     * The session ended.
+     *
+     * `code` and `reason` come from the peer's close capsule. When
+     * {@link WebTransportSession.close} ended the session, they are the values
+     * passed to it instead. They are `0` and `""` when the session went away
+     * without a capsule, which is what a dropped connection looks like.
+     *
+     * The session is already closed when this runs. `sendDatagram` returns `0`
+     * and `closed` is `true`.
+     */
+    close?(session: WebTransportSession<T>, code: number, reason: string): void | Promise<void>;
+
+    /**
+     * The connection's send queue has emptied after refusing a datagram.
+     *
+     * Fires once per refusal-then-empty cycle: after a
+     * {@link WebTransportSession.sendDatagram} returns `0`, the next time the
+     * queued datagrams have all been handed to the network, every session on
+     * that connection hears `drain`. Resume sending here rather than polling.
+     *
+     * The queue belongs to the connection, so a session that never saw a `0`
+     * can still hear a drain when another session on the same connection
+     * filled the queue.
+     */
+    drain?(session: WebTransportSession<T>): void | Promise<void>;
   }
 
   namespace Serve {
@@ -839,12 +1031,50 @@ declare module "bun" {
       http3?: boolean;
 
       /**
-       * Listen for HTTP/1.1 over TCP. Set to `false` together with
-       * `http3: true` to serve HTTP/3 only.
+       * Also serve HTTP/2 on the same port. With {@link tls}, clients that
+       * offer "h2" via ALPN get HTTP/2 and everyone else gets HTTP/1.1;
+       * without it, connections that open with the HTTP/2 preface
+       * ("prior knowledge") get HTTP/2.
+       * @default false
+       * @experimental
+       */
+      http2?: boolean;
+
+      /**
+       * Serve HTTP/1.1. Set to `false` together with `http2: true` and/or
+       * `http3: true` to refuse HTTP/1.x clients.
        * @default true
        * @experimental
        */
       http1?: boolean;
+
+      /**
+       * Accept WebTransport sessions on this server. Requires {@link http3}.
+       *
+       * A session arrives as an extended `CONNECT`, not through {@link fetch}.
+       * These handlers are the whole of the API. Ordinary HTTP/3 on the same
+       * server is unaffected.
+       *
+       * Give this up front. It changes the `SETTINGS` the HTTP/3 listener
+       * advertises, and a later `reload()` cannot add it to a server that
+       * started without it.
+       *
+       * To give {@link WebTransportSession.data} a type, declare the handler
+       * separately. There is no server-level type parameter for it, because a
+       * session is not an upgraded request and shares nothing with
+       * {@link websocket}:
+       *
+       * ```ts
+       * const webtransport: Bun.WebTransportHandler<{ seen: number }> = {
+       *   open(session) { session.data = { seen: 0 }; },
+       *   datagram(session, data) { session.data.seen += data.length; },
+       * };
+       * Bun.serve({ port: 0, tls, http3: true, webtransport, fetch: () => new Response() });
+       * ```
+       *
+       * @experimental
+       */
+      webtransport?: WebTransportHandler;
 
       /**
        * Sets the number of seconds to wait before timing out a connection

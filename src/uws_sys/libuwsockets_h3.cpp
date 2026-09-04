@@ -9,7 +9,9 @@
 
 #include <bun-uws/src/Http3App.h>
 #include <bun-uws/src/Http3Response.h>
+#include <bun-uws/src/Http3Context.h>
 #include <bun-uws/src/Http3Request.h>
+#include <bun-uws/src/Http3WebTransport.h>
 #include <string_view>
 #include <string.h>
 // clang-format on
@@ -17,9 +19,11 @@
 extern "C" const char* ares_inet_ntop(int af, const char* src, char* dst, size_t size);
 
 using uWS::H3App;
+using uWS::Http3Context;
 using uWS::Http3Request;
 using uWS::Http3Response;
 using uWS::Http3ResponseData;
+using uWS::Http3WebTransportSession;
 
 static inline std::string_view sv(const char* p, size_t n) { return p ? std::string_view { p, n } : std::string_view {}; }
 
@@ -39,21 +43,20 @@ typedef void (*uws_h3_listen_handler)(us_quic_listen_socket_t*, void*);
 
 /* ───── app ───── */
 
-uws_h3_app_t* uws_h3_create_app(struct us_bun_socket_context_options_t options, unsigned int idle_timeout_s)
+uws_h3_app_t* uws_h3_create_app(struct us_bun_socket_context_options_t options, unsigned int idle_timeout_s,
+    bool webtransport)
 {
     static int once = (us_quic_global_init(), 1);
     (void)once;
     uWS::SocketContextOptions sco;
     static_assert(sizeof(sco) == sizeof(options));
     memcpy(&sco, &options, sizeof(sco));
-    return (uws_h3_app_t*)H3App::create(sco, idle_timeout_s);
+    return (uws_h3_app_t*)H3App::create(sco, idle_timeout_s, webtransport);
 }
 
 void uws_h3_app_destroy(uws_h3_app_t* app) { delete (H3App*)app; }
-bool uws_h3_constructor_failed(uws_h3_app_t* app) { return !app || ((H3App*)app)->constructorFailed(); }
 void uws_h3_app_close(uws_h3_app_t* app) { ((H3App*)app)->close(); }
 void uws_h3_app_clear_routes(uws_h3_app_t* app) { ((H3App*)app)->clearRoutes(); }
-void* uws_h3_get_native_handle(uws_h3_app_t* app) { return ((H3App*)app)->getNativeHandle(); }
 
 bool uws_h3_app_add_server_name(uws_h3_app_t* app, const char* hostname,
     struct us_bun_socket_context_options_t options)
@@ -80,6 +83,7 @@ H3_ROUTE(patch, patch)
 H3_ROUTE(put, put)
 H3_ROUTE(head, head)
 H3_ROUTE(connect, connect)
+H3_ROUTE(webtransport_connect, webtransportConnect)
 H3_ROUTE(trace, trace)
 H3_ROUTE(any, any)
 #undef H3_ROUTE
@@ -177,8 +181,6 @@ bool uws_h3_res_write(uws_h3_res_t* res, const char* data, size_t* length)
     return ok;
 }
 
-uint64_t uws_h3_res_get_write_offset(uws_h3_res_t* res) { return ((Http3Response*)res)->getWriteOffset(); }
-void uws_h3_res_override_write_offset(uws_h3_res_t* res, uint64_t off) { ((Http3Response*)res)->overrideWriteOffset(off); }
 bool uws_h3_res_has_responded(uws_h3_res_t* res) { return ((Http3Response*)res)->hasResponded(); }
 size_t uws_h3_res_get_buffered_amount(uws_h3_res_t* res) { return ((Http3Response*)res)->getBufferedAmount(); }
 
@@ -189,10 +191,6 @@ void uws_h3_res_end_sendfile(uws_h3_res_t* res, uint64_t, bool close)
     /* sendfile path falls back to plain end-of-stream over QUIC. */
     ((Http3Response*)res)->sendTerminatingChunk(close);
 }
-void uws_h3_res_prepare_for_sendfile(uws_h3_res_t*) {}
-bool uws_h3_res_is_connect_request(uws_h3_res_t*) { return false; }
-void* uws_h3_res_get_native_handle(uws_h3_res_t* res) { return res; }
-void* uws_h3_res_get_socket_data(uws_h3_res_t* res) { return ((Http3Response*)res)->getSocketData(); }
 
 void uws_h3_res_on_writable(uws_h3_res_t* res, bool (*h)(uws_h3_res_t*, uint64_t, void*), void* opt)
 {
@@ -222,8 +220,6 @@ void uws_h3_res_cork(uws_h3_res_t* res, void* ctx, void (*corker)(void*))
 {
     ((Http3Response*)res)->cork([ctx, corker]() { corker(ctx); });
 }
-void uws_h3_res_uncork(uws_h3_res_t*) {}
-bool uws_h3_res_is_corked(uws_h3_res_t*) { return false; }
 
 uint64_t uws_h3_res_get_remote_address_info(uws_h3_res_t* res, const char** dest, int* port, bool* is_ipv6)
 {
@@ -258,8 +254,6 @@ uint64_t uws_h3_res_get_remote_address_info(uws_h3_res_t* res, const char** dest
 
 /* ───── request ───── */
 
-bool uws_h3_req_is_ancient(uws_h3_req_t*) { return false; }
-bool uws_h3_req_get_yield(uws_h3_req_t* req) { return ((Http3Request*)req)->getYield(); }
 void uws_h3_req_set_yield(uws_h3_req_t* req, bool y) { ((Http3Request*)req)->setYield(y); }
 
 /* The FFI contract requires a non-null pointer; a default-
@@ -285,22 +279,86 @@ size_t uws_h3_req_get_header(uws_h3_req_t* req, const char* lower, size_t lower_
     return ffi_sv(((Http3Request*)req)->getHeader(sv(lower, lower_len)), dest);
 }
 
-void uws_h3_req_for_each_header(uws_h3_req_t* req,
-    void (*cb)(const char*, size_t, const char*, size_t, void*),
-    void* user_data)
+/* ───── webtransport ───── */
+
+typedef struct uws_h3_wt_s uws_h3_wt_t;
+
+typedef void (*uws_h3_wt_datagram_handler)(uws_h3_wt_t*, const char*, unsigned int);
+typedef void (*uws_h3_wt_close_handler)(uws_h3_wt_t*, uint32_t, const char*, size_t);
+typedef void (*uws_h3_wt_drain_handler)(uws_h3_wt_t*);
+
+void uws_h3_app_on_webtransport(uws_h3_app_t* app, uws_h3_wt_datagram_handler on_datagram,
+    uws_h3_wt_close_handler on_close, uws_h3_wt_drain_handler on_drain)
 {
-    ((Http3Request*)req)->forEachHeader([cb, user_data](std::string_view name, std::string_view value) {
-        cb(name.empty() ? "" : name.data(), name.length(),
-            value.empty() ? "" : value.data(), value.length(), user_data);
-    });
+    ((H3App*)app)->onWebTransport(
+        (void (*)(Http3WebTransportSession*, const char*, unsigned))on_datagram,
+        (void (*)(Http3WebTransportSession*, uint32_t, const char*, size_t))on_close,
+        (void (*)(Http3WebTransportSession*))on_drain);
 }
 
-size_t uws_h3_req_get_query(uws_h3_req_t* req, const char* key, size_t key_len, const char** dest)
+/* Extended CONNECT with `:protocol: webtransport` (RFC 9220). Anything else on
+ * a CONNECT route is an ordinary tunnel request. */
+bool uws_h3_req_is_webtransport(uws_h3_req_t* req)
 {
-    return ffi_sv(key ? ((Http3Request*)req)->getQuery(sv(key, key_len))
-                      : ((Http3Request*)req)->getQuery(),
-        dest);
+    Http3Request* r = (Http3Request*)req;
+    /* getMethod() lowercases into the request's scratch buffer, so match in
+     * lower case: the :method pseudo-header itself is "CONNECT". */
+    return r->getMethod() == "connect" && r->getHeader(":protocol") == "webtransport";
 }
+
+/* Answer the CONNECT with 200 and keep the stream open as a session. Null when
+ * the response was already written to, or the connection never negotiated the
+ * extension; the caller still owns the response either way. */
+uws_h3_wt_t* uws_h3_res_upgrade_webtransport(uws_h3_res_t* res, uws_h3_req_t* req, void* user_data)
+{
+    Http3Response* r = (Http3Response*)res;
+    std::string_view req_draft02 = ((Http3Request*)req)->getHeader("sec-webtransport-http3-draft02");
+    Http3ResponseData* d = r->getHttpResponseData();
+    if (d->state & (Http3ResponseData::HTTP_WRITE_CALLED | Http3ResponseData::HTTP_END_CALLED)) {
+        return nullptr;
+    }
+    /* Before the headers: lsquic decides framing from this. */
+    if (us_quic_stream_accept_webtransport((us_quic_stream_t*)r) != 0) return nullptr;
+    r->writeStatus("200 OK");
+    /* draft-02 clients require this echoed back before the session is open;
+     * draft-07 dropped it, so echo only when asked. */
+    if (!req_draft02.empty()) {
+        r->writeHeader("sec-webtransport-http3-draft", "draft02");
+    }
+    r->flushHeaders();
+    /* A session has neither a body write nor a FIN to push the 200 out, so
+     * without this the client waits out its handshake timeout. */
+    us_quic_stream_flush((us_quic_stream_t*)r);
+    d->wtUserData = user_data;
+    /* Taken now: the context data is destructed before the engine that
+     * dispatches on_close. */
+    d->wtOnClose = ((Http3Context*)us_quic_stream_context((us_quic_stream_t*)r))
+                       ->getContextData()
+                       ->onWebTransportClose;
+    return (uws_h3_wt_t*)r;
+}
+
+void* uws_h3_wt_get_user_data(uws_h3_wt_t* wt) { return ((Http3WebTransportSession*)wt)->getUserData(); }
+void uws_h3_wt_set_user_data(uws_h3_wt_t* wt, void* ud) { ((Http3WebTransportSession*)wt)->setUserData(ud); }
+
+int uws_h3_wt_send_datagram(uws_h3_wt_t* wt, const char* data, unsigned int len)
+{
+    return ((Http3WebTransportSession*)wt)->sendDatagram(data, len);
+}
+
+unsigned int uws_h3_wt_max_datagram_size(uws_h3_wt_t* wt)
+{
+    return ((Http3WebTransportSession*)wt)->maxDatagramSize();
+}
+
+uint32_t uws_h3_wt_rtt(uws_h3_wt_t* wt) { return ((Http3WebTransportSession*)wt)->rtt(); }
+
+void uws_h3_wt_close(uws_h3_wt_t* wt, uint32_t code, const char* reason, size_t reason_len)
+{
+    ((Http3WebTransportSession*)wt)->close(code, sv(reason, reason_len));
+}
+
+void uws_h3_wt_drain(uws_h3_wt_t* wt) { ((Http3WebTransportSession*)wt)->drain(); }
 
 #pragma clang attribute pop
 

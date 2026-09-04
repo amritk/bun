@@ -733,6 +733,11 @@ export const defines: Flag[] = [
       "NODE_API_EXPERIMENTAL_NOGC_ENV_OPT_OUT=1",
       "NOMINMAX",
       "BUILDING_JSCONLY__",
+      // Adds two fields to struct lsquic_engine_settings. quic.c,
+      // node_quic_shim.c and the H3 C ABI all sizeof() that struct, so this
+      // must match the value the lsquic dep was built with; a mismatch is a
+      // silent ABI split, not a link error. See scripts/build/deps/lsquic.ts.
+      "LSQUIC_WEBTRANSPORT_SERVER_SUPPORT=1",
     ],
     desc: "Core bun defines (always on)",
   },
@@ -1228,6 +1233,15 @@ export const linkerFlags: Flag[] = [
     ].map(s => `-Wl,--wrap=${s}`),
     when: c => c.linux && c.abi === "gnu",
     desc: "Wrap glibc 2.18+ symbols (portable down to glibc 2.17)",
+  },
+  {
+    // c-bindings.cpp: __wrap_execve records that an exec of this process is in
+    // flight, and __wrap_pthread_create retries the EAGAIN the kernel returns
+    // for clone(CLONE_FS) during that window (the --watch reload). Behavioral,
+    // not a version pin, so it applies to every Linux libc.
+    flag: ["-Wl,--wrap=execve", "-Wl,--wrap=pthread_create"],
+    when: c => c.linux,
+    desc: "Retry pthread_create EAGAIN caused by an in-flight execve",
   },
   {
     flag: ["-static-libstdc++", "-static-libgcc"],
